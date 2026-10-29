@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.lock
+
+# Local state and generated artifacts
+logs/
+generated/
+backups/
+drafts/
+pilot/
+queue/
+drafts/*.json
+tmp-*.json
+tmp-*.py
+STATUS.md
+ALERTS.md
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+opencode.json
+opencode.jsonc
