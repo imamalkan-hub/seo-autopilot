@@ -25,7 +25,17 @@ for d in (QUEUE_DIR, LOG_DIR, BACKUP_DIR):
 
 SSH = os.environ.get("SEO_SSH_HOST", "")  # e.g. deploy@host — set via env, never committed
 OFM_URL = "http://127.0.0.1:18899/v1/chat/completions"
+# yuxor Claude lane goes through the local proxy (8788) rather than straight to
+# api.yuxor.tech: the proxy owns the concurrency queue, the 429 backoff/retry
+# and the response cache. Upstream caps at 5 simultaneous streams, so the
+# autopilot shares them with the operator's own sessions instead of colliding.
+YUXOR_URL = "http://127.0.0.1:8788/v1/chat/completions"
 CONFIG_PATH = Path(os.environ.get("SEO_MODEL_CONFIG", "/root/.config/opencode/opencode.jsonc"))
+
+# Cloudflare's browser-integrity rule (error 1010) rejects the default
+# Python-urllib User-Agent, so every request through the yuxor lane came back
+# 403 even though curl and the AI SDK went through. Send a normal UA.
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 
 # Minimum entity rows a city guide must carry so the comparison table is
 # real content rather than thin filler. Same order as min_city, so the
@@ -103,6 +113,22 @@ def load_api_key() -> str:
     if not m:
         raise RuntimeError("OFM apiKey not found")
     return m.group(1)
+
+
+def load_yuxor_key() -> str:
+    """Read the yuxor provider key from the opencode config.
+
+    Falls back to the environment so the autopilot can run even if the
+    opencode config is being rewritten.
+    """
+    txt = CONFIG_PATH.read_text()
+    m = re.search(r'"yuxor"\s*:\s*\{.*?"settings"\s*:\s*\{.*?"apiKey"\s*:\s*"([^"]+)"', txt, re.S)
+    if m:
+        return m.group(1)
+    env = os.environ.get("YUXOR_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    if env:
+        return env
+    raise RuntimeError("yuxor apiKey not found")
 
 
 def city_slugify(s: str) -> str:

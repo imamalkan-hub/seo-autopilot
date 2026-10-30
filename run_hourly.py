@@ -14,6 +14,10 @@ import monitor
 
 LOCK = ROOT / "autopilot.lock"
 PER_SITE = int(os.environ.get("PER_SITE", "25"))
+# Sites are generated in parallel; each site runs GEN_WORKERS generators, so
+# the yuxor lane sees SITE_WORKERS * GEN_WORKERS requests. The local proxy
+# queues them against the upstream's 5-stream cap instead of failing.
+SITE_WORKERS = int(os.environ.get("SITE_WORKERS", "2"))
 RUN_LOG = LOG_DIR / "hourly.jsonl"
 
 
@@ -29,7 +33,7 @@ def main() -> int:
     fh.flush()
     started = time.time()
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=SITE_WORKERS) as ex:
         futs = {ex.submit(run_site, key, PER_SITE, True): key for key in SITES}
         for f in concurrent.futures.as_completed(futs):
             key = futs[f]

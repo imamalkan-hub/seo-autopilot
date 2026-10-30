@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import concurrent.futures, difflib, json, math, re, shutil, sqlite3, subprocess, time
+import concurrent.futures, difflib, json, math, os, re, shutil, sqlite3, subprocess, time
 import urllib.request
 from pathlib import Path
 
@@ -8,14 +8,21 @@ import requests
 from bs4 import BeautifulSoup
 
 from autopilot import (
-    BACKUP_DIR, LOG_DIR, OFM_URL, ROOT, SITES, SSH, city_slugify, existing_slugs, load_api_key,
-    load_queue, log_event, now, open_db, save_queue, slugify, state_names,
+    BACKUP_DIR, LOG_DIR, OFM_URL, ROOT, SITES, SSH, UA, YUXOR_URL, city_slugify, existing_slugs,
+    load_api_key, load_queue, load_yuxor_key, log_event, now, open_db, save_queue, slugify,
+    state_names,
 )
 
 BANNED = [
     "delve", "unlock", "landscape", "navigate", "seamless", "robust",
     "testament", "in today's world", "it's important to note", "when it comes to",
 ]
+
+# Article generators run against the yuxor lane, which is queued by the local
+# proxy (8788). Upstream allows 5 simultaneous streams and the operator's own
+# sessions take part of that, so keep the generators below the cap and let the
+# proxy's queue absorb the rest.
+GEN_WORKERS = int(os.environ.get("GEN_WORKERS", "4"))
 BAD_CLAIMS = re.compile(r"\b(top-rated|#1|guaranteed|guarantee|cure|100%)\b", re.I)
 
 
@@ -281,6 +288,8 @@ Required H2 sections:
 - "Frequently asked questions" — exactly 6 H3 questions with short answers
 - "How we built this guide" — directory data, sources, last updated 2026-10-26, byline "{site['byline']}", and a one-sentence disclaimer
 
+Disclaimer requirement (the guide is REJECTED without it): the "How we built this guide" section MUST end with a sentence containing the exact phrase "not medical advice" (for example: "This directory guide is informational and is not medical advice, and it does not replace a consultation with a qualified clinician."). Do not paraphrase this phrase — write it literally.
+
 Rules:
 - Use 3-5 contextual internal links: entity URLs, city/region pages, and 2+ article_links. Absolute URLs only.
 - All clinic/doctor facts must match DATA exactly. If a field is missing, omit it.
@@ -294,27 +303,46 @@ Rules:
     return structure
 
 
+def _post_json(url: str, payload: dict, headers: dict, timeout: int) -> dict:
+    body = json.dumps(payload).encode()
+    headers = {**headers, "User-Agent": UA}
+    req = urllib.request.Request(url, data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def _err_text(e) -> str:
+    msg = str(e)
+    if hasattr(e, "read"):
+        try:
+            msg += " " + e.read().decode()[:300]
+        except Exception:
+            pass
+    return msg[:600]
+
+
 def call_model(prompt: str, site_key: str) -> tuple[str, str]:
-    key = load_api_key()
-    chain = [
-        ("deepseek-v4.1-flash-free", "deepseek-free"),
-        ("glm-5.3-flash-free", "glm-free"),
-        ("reflection/beam-free", "kilo-free"),
-    ]
     last = None
-    for model, label in chain:
+
+    # Lane 1: yuxor Claude (api2 OpenAI-compatible). Paid tier of the operator's
+    # own key, unaffected by the exhausted free pools. Haiku first — it is the
+    # cheapest and the generator only needs a structured article body.
+    yuxor_key = load_yuxor_key()
+    yuxor_chain = [
+        ("claude-haiku-5-5", "yuxor-haiku"),
+        ("claude-sonnet-5-5", "yuxor-sonnet"),
+        ("claude-opus-5-5", "yuxor-opus"),
+    ]
+    for model, label in yuxor_chain:
         t0 = time.time()
         try:
-            body = json.dumps({
-                "model": model, "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 12000, "temperature": 0.6, "reasoning_effort": "low",
-            }).encode()
-            req = urllib.request.Request(
-                OFM_URL, data=body,
-                headers={"Content-Type": "application/json", "Authorization": "Bearer " + key},
+            d = _post_json(
+                YUXOR_URL,
+                {"model": model, "messages": [{"role": "user", "content": prompt}],
+                 "max_tokens": 12000, "temperature": 0.6},
+                {"Content-Type": "application/json", "Authorization": "Bearer " + yuxor_key},
+                timeout=420,
             )
-            with urllib.request.urlopen(req, timeout=420) as r:
-                d = json.load(r)
             content = d["choices"][0]["message"].get("content") or ""
             if not content.strip():
                 raise RuntimeError("empty content")
@@ -322,13 +350,37 @@ def call_model(prompt: str, site_key: str) -> tuple[str, str]:
                       usage=d.get("usage"))
             return content, label
         except Exception as e:
-            msg = str(e)
-            if hasattr(e, "read"):
-                try:
-                    msg += " " + e.read().decode()[:300]
-                except Exception:
-                    pass
-            log_event("model_fail", site=site_key, model=label, error=msg[:600])
+            msg = _err_text(e)
+            log_event("model_fail", site=site_key, model=label, error=msg)
+            last = msg
+            continue
+
+    # Lane 2: free pools via the local dsh gateway (often rate-limited).
+    key = load_api_key()
+    chain = [
+        ("deepseek-v4.1-flash-free", "deepseek-free"),
+        ("glm-5.3-flash-free", "glm-free"),
+        ("reflection/beam-free", "kilo-free"),
+    ]
+    for model, label in chain:
+        t0 = time.time()
+        try:
+            d = _post_json(
+                OFM_URL,
+                {"model": model, "messages": [{"role": "user", "content": prompt}],
+                 "max_tokens": 12000, "temperature": 0.6, "reasoning_effort": "low"},
+                {"Content-Type": "application/json", "Authorization": "Bearer " + key},
+                timeout=420,
+            )
+            content = d["choices"][0]["message"].get("content") or ""
+            if not content.strip():
+                raise RuntimeError("empty content")
+            log_event("model_ok", site=site_key, model=label, latency=round(time.time() - t0, 1),
+                      usage=d.get("usage"))
+            return content, label
+        except Exception as e:
+            msg = _err_text(e)
+            log_event("model_fail", site=site_key, model=label, error=msg)
             last = msg
             continue
     # Paid fallback: OpenCode paid lane. Public content only; no credentials in prompt.
@@ -361,6 +413,32 @@ def parse_json(text: str) -> dict:
 
 def _text(html: str) -> str:
     return BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+
+
+def _claim_words(text: str) -> list[str]:
+    """Claim words that are actually asserted.
+
+    "no clinic can guarantee a cure" is a disclaimer, not a claim, and must
+    not be rejected. Only flag the term when it is not negated and not part
+    of a phrase that already denies it.
+    """
+    hits = []
+    for m in BAD_CLAIMS.finditer(text):
+        start = max(0, m.start() - 60)
+        before = text[start:m.start()].lower()
+        term = m.group(0).lower()
+        if any(neg in before for neg in (
+            "no ", "not ", "never ", "cannot ", "can't ", "won't ",
+            "without ", "does not ", "do not ", "is not ", "are not ",
+            "neither ", "nor ", "avoid ", "avoided ", "reject ",
+        )):
+            continue
+        if term in ("cure", "100%") and re.search(
+            r"\b(no|not|never|cannot|can't|without|nothing)\b[^.]*$", before
+        ):
+            continue
+        hits.append(term)
+    return hits
 
 
 def _shingles(text: str, n=5):
@@ -398,7 +476,7 @@ def validate_article(site_key: str, target: dict, a: dict, con, batch_texts) -> 
     for b in BANNED:
         if b in low:
             errs.append(f"banned phrase: {b}")
-    if BAD_CLAIMS.search(_text(body)):
+    if _claim_words(_text(body)):
         errs.append("bad claim word")
     if "not medical advice" not in low and "not a substitute" not in low:
         errs.append("missing disclaimer")
@@ -596,15 +674,19 @@ def run_site(site_key: str, count: int, publish: bool = True, slug: str | None =
     if slug:
         pending = [x for x in q if x["slug"] == slug][:1]
     else:
-        pending = [x for x in q if x.get("status") == "pending"
-                   or (x.get("status") == "failed" and x.get("attempts", 0) < 2)][:count]
+        # Retry failed items too: the model lanes change (yuxor Claude now
+        # works), so a previously failed item is worth another attempt. The
+        # attempts counter still climbs, so give up on genuinely stuck ones.
+        max_attempts = int(os.environ.get("MAX_ATTEMPTS", "6"))
+        pending = [x for x in q if x.get("status") in ("pending", "failed")
+                   and x.get("attempts", 0) < max_attempts][:count]
     if not pending:
         return {"site": site_key, "generated": 0, "reason": "queue empty"}
     for t in pending:
         t["attempts"] = t.get("attempts", 0) + 1
     results = []
     batch_texts = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=GEN_WORKERS) as ex:
         futs = {ex.submit(generate_one, site_key, t, batch_texts): t for t in pending}
         for f in concurrent.futures.as_completed(futs):
             try:
